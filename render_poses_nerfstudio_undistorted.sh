@@ -1,0 +1,1 @@
+/home/ykguo/Documents/robot_capture_2024/run_baselines/render_poses_nerfstudio_undistorted.sh
