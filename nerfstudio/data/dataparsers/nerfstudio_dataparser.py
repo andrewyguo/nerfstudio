@@ -32,12 +32,58 @@ from nerfstudio.data.utils.dataparsers_utils import (
     get_train_eval_split_filename,
     get_train_eval_split_fraction,
     get_train_eval_split_interval,
+    get_train_eval_split_fraction_custom,
 )
 from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils.rich_utils import CONSOLE
 
 MAX_AUTO_RESOLUTION = 1600
 
+# ANDREW NOTE: REMOVE THIS WHEN DONE - ADDED 0507 
+def compute_camera_path_length(poses: torch.Tensor) -> float:
+    """
+    Computes the total path length of a sequence of camera poses.
+    
+    Args:
+        poses (torch.Tensor): A tensor of shape (N, 4, 4) containing N camera-to-world matrices.
+
+    Returns:
+        float: The total Euclidean path length across all poses.
+    """
+    # Extract 3D positions (translation vectors)
+    positions = poses[:, :3, 3]  # Shape: (N, 3)
+    
+    # Compute differences between consecutive positions
+    diffs = positions[1:] - positions[:-1]  # Shape: (N-1, 3)
+    
+    # Compute Euclidean distances and sum them
+    distances = torch.norm(diffs, dim=1)  # Shape: (N-1,)
+    path_length = distances.sum().item()
+    
+    return path_length
+
+def compute_path_length_from_cameras(cameras: Cameras) -> float:
+    """
+    Computes the total camera path length for a Cameras object.
+
+    Args:
+        cameras (Cameras): Nerfstudio Cameras dataclass, with .camera_to_worlds of shape [..., 3, 4].
+
+    Returns:
+        float: Sum of Euclidean distances between consecutive camera positions.
+    """
+    # Flatten any batch dims so we have shape (N, 3, 4)
+    cams_flat = cameras.flatten()
+    c2w = cams_flat.camera_to_worlds  # Tensor[N, 3, 4]
+
+    # Extract positions (translation vector is last column)
+    positions = c2w[:, :3, 3]         # Tensor[N, 3]
+
+    # Compute diffs and their norms
+    diffs = positions[1:] - positions[:-1]    # Tensor[N-1, 3]
+    distances = torch.norm(diffs, dim=1)       # Tensor[N-1]
+
+    return float(distances.sum().item())
 
 @dataclass
 class NerfstudioDataParserConfig(DataParserConfig):
@@ -59,7 +105,7 @@ class NerfstudioDataParserConfig(DataParserConfig):
     """The method to use to center the poses."""
     auto_scale_poses: bool = True
     """Whether to automatically scale the poses to fit in +/- 1 bounding box."""
-    eval_mode: Literal["fraction", "filename", "interval", "all"] = "fraction"
+    eval_mode: Literal["fraction", "filename", "interval", "all", "fraction-first", "fraction-last", "fraction-middle"] = "fraction"
     """
     The method to use for splitting the dataset into train and eval.
     Fraction splits based on a percentage for train and the remaining for eval.
@@ -212,6 +258,12 @@ class Nerfstudio(DataParser):
                 i_train, i_eval = get_train_eval_split_filename(image_filenames)
             elif self.config.eval_mode == "interval":
                 i_train, i_eval = get_train_eval_split_interval(image_filenames, self.config.eval_interval)
+            elif self.config.eval_mode == "fraction-first":
+                i_train, i_eval = get_train_eval_split_fraction_custom(image_filenames, self.config.train_split_fraction, mode="first")
+            elif self.config.eval_mode == "fraction-last":
+                i_train, i_eval = get_train_eval_split_fraction_custom(image_filenames, self.config.train_split_fraction, mode="last")
+            elif self.config.eval_mode == "fraction-middle":
+                i_train, i_eval = get_train_eval_split_fraction_custom(image_filenames, self.config.train_split_fraction, mode="middle")
             elif self.config.eval_mode == "all":
                 CONSOLE.log(
                     "[yellow] Be careful with '--eval-mode=all'. If using camera optimization, the cameras may diverge in the current implementation, giving unpredictable results."
@@ -234,12 +286,15 @@ class Nerfstudio(DataParser):
             orientation_method = self.config.orientation_method
 
         poses = torch.from_numpy(np.array(poses).astype(np.float32))
+        path_length = compute_camera_path_length(poses)
+        CONSOLE.log(f"[yellow] (1) split: {split} | Dataset camera path length: {path_length:.2f}")
         poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
             poses,
             method=orientation_method,
             center_method=self.config.center_method,
         )
-
+        path_length = compute_camera_path_length(poses)
+        CONSOLE.log(f"[yellow] (2) split: {split} | Dataset camera path length: {path_length:.2f}")
         # Scale poses
         scale_factor = 1.0
         if self.config.auto_scale_poses:
@@ -247,7 +302,8 @@ class Nerfstudio(DataParser):
         scale_factor *= self.config.scale_factor
 
         poses[:, :3, 3] *= scale_factor
-
+        path_length = compute_camera_path_length(poses)
+        CONSOLE.log(f"[yellow] (3) split: {split} | Dataset camera path length: {path_length:.2f}")
         # Choose image_filenames and poses based on split, but after auto orient and scaling the poses.
         image_filenames = [image_filenames[i] for i in indices]
         mask_filenames = [mask_filenames[i] for i in indices] if len(mask_filenames) > 0 else []
@@ -255,7 +311,8 @@ class Nerfstudio(DataParser):
 
         idx_tensor = torch.tensor(indices, dtype=torch.long)
         poses = poses[idx_tensor]
-
+        path_length = compute_camera_path_length(poses)
+        CONSOLE.log(f"[yellow] (4) split: {split} | Dataset camera path length: {path_length:.2f}")
         # in x,y,z order
         # assumes that the scene is centered at the origin
         aabb_scale = self.config.scene_scale
@@ -297,7 +354,8 @@ class Nerfstudio(DataParser):
         metadata = {}
         if (camera_type in [CameraType.FISHEYE, CameraType.FISHEYE624]) and (fisheye_crop_radius is not None):
             metadata["fisheye_crop_radius"] = fisheye_crop_radius
-
+        path_length = compute_camera_path_length(poses)
+        CONSOLE.log(f"[yellow] (5) split: {split} | Dataset camera path length: {path_length:.2f}")
         cameras = Cameras(
             fx=fx,
             fy=fy,
@@ -310,16 +368,19 @@ class Nerfstudio(DataParser):
             camera_type=camera_type,
             metadata=metadata,
         )
+        path_length = compute_path_length_from_cameras(cameras)
+        CONSOLE.log(f"[yellow] (6) split: {split} | Camera path length: {path_length:.2f}")
 
         assert self.downscale_factor is not None
         cameras.rescale_output_resolution(scaling_factor=1.0 / self.downscale_factor)
-
+        path_length = compute_path_length_from_cameras(cameras)
+        CONSOLE.log(f"[yellow] (7) split: {split} | Camera path length: {path_length:.2f}")
         # The naming is somewhat confusing, but:
         # - transform_matrix contains the transformation to dataparser output coordinates from saved coordinates.
         # - dataparser_transform_matrix contains the transformation to dataparser output coordinates from original data coordinates.
         # - applied_transform contains the transformation to saved coordinates from original data coordinates.
         applied_transform = None
-        colmap_path = self.config.data / "colmap/sparse/0"
+        colmap_path = data_dir / "colmap_sparse/0"
         if "applied_transform" in meta:
             applied_transform = torch.tensor(meta["applied_transform"], dtype=transform_matrix.dtype)
         elif colmap_path.exists():
@@ -327,7 +388,9 @@ class Nerfstudio(DataParser):
             # used before we added the applied_transform field to the output dataformat.
             meta["applied_transform"] = [[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, -1, 0]]
             applied_transform = torch.tensor(meta["applied_transform"], dtype=transform_matrix.dtype)
-
+        CONSOLE.log(f"[yellow] applied_transform: {applied_transform}")
+        CONSOLE.log(f"[yellow] transform_matrix: {transform_matrix}")
+        CONSOLE.log(f"[yellow] scale_factor: {scale_factor}")
         if applied_transform is not None:
             dataparser_transform_matrix = transform_matrix @ torch.cat(
                 [applied_transform, torch.tensor([[0, 0, 0, 1]], dtype=transform_matrix.dtype)], 0
@@ -347,9 +410,11 @@ class Nerfstudio(DataParser):
             self.prompted_user
         except AttributeError:
             self.prompted_user = False
-
+        print(f"{colmap_path} colmap_path.exists(): {colmap_path.exists()}")
+        print(f"self.config.load_3D_points: {self.config.load_3D_points}")
         # Load 3D points
         if self.config.load_3D_points:
+
             if "ply_file_path" in meta:
                 ply_file_path = data_dir / meta["ply_file_path"]
 
@@ -357,11 +422,12 @@ class Nerfstudio(DataParser):
                 from rich.prompt import Confirm
 
                 # check if user wants to make a point cloud from colmap points
-                if not self.prompted_user:
-                    self.create_pc = Confirm.ask(
-                        "load_3D_points is true, but the dataset was processed with an outdated ns-process-data that didn't convert colmap points to .ply! Update the colmap dataset automatically?"
-                    )
-
+                # if not self.prompted_user:
+                #     self.create_pc = Confirm.ask(
+                #         "load_3D_points is true, but the dataset was processed with an outdated ns-process-data that didn't convert colmap points to .ply! Update the colmap dataset automatically?"
+                #     )
+                # print(f"self.prompted_user: {self.prompted_user}")
+                self.create_pc = True 
                 if self.create_pc:
                     import json
 
@@ -398,6 +464,7 @@ class Nerfstudio(DataParser):
                 ply_file_path = None
 
             if ply_file_path:
+                print(f"Nerfstudio dataparser. Loading 3D points from {ply_file_path}")
                 sparse_points = self._load_3D_points(ply_file_path, transform_matrix, scale_factor)
                 if sparse_points is not None:
                     metadata.update(sparse_points)
@@ -469,8 +536,12 @@ class Nerfstudio(DataParser):
 
         if self.downscale_factor is None:
             if self.config.downscale_factor is None:
-                test_img = Image.open(data_dir / filepath)
-                h, w = test_img.size
+                if filepath.suffix == ".npy":
+                    test_img = np.load(data_dir / filepath).astype(np.float32)
+                    h, w = test_img.shape[:2]
+                else:
+                    test_img = Image.open(data_dir / filepath)
+                    h, w = test_img.size
                 max_res = max(h, w)
                 df = 0
                 while True:

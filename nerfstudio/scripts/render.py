@@ -842,6 +842,7 @@ class DatasetRender(BaseRender):
                                 output_image = outputs[output_name]
                                 if is_depth:
                                     # Divide by the dataparser scale factor
+                                    print(f"Dividing by dataparser_outputs.dataparser_scale: {dataparser_outputs.dataparser_scale}")
                                     output_image.div_(dataparser_outputs.dataparser_scale)
                         else:
                             if output_name.startswith("gt-"):
@@ -879,8 +880,9 @@ class DatasetRender(BaseRender):
 
                         # Save to file
                         if is_raw:
-                            with gzip.open(output_path.with_suffix(".npy.gz"), "wb") as f:
-                                np.save(f, output_image)
+                            # with gzip.open(output_path.with_suffix(".npy.gz"), "wb") as f:
+                            #     np.save(f, output_image)
+                            np.save(output_path.with_suffix(".npy"), output_image)
                         elif self.image_format == "png":
                             media.write_image(output_path.with_suffix(".png"), output_image, fmt="png")
                         elif self.image_format == "jpeg":

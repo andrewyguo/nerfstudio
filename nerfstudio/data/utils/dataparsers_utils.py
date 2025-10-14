@@ -19,6 +19,49 @@ from typing import List, Tuple
 
 import numpy as np
 
+def get_train_eval_split_fraction_custom(
+    image_filenames: List, train_split_fraction: float, mode: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Split frames into train/eval using a contiguous fraction determined by `mode`.
+
+    Args:
+        image_filenames: list of image filenames (order assumed to be the sequence order)
+        train_split_fraction: fraction of images to use for training in [0, 1]
+        mode: one of {"first", "last", "middle"}
+            - "first":   first fraction -> train, remainder -> eval
+            - "last":    last fraction  -> train, remainder -> eval
+            - "middle":  centered block -> train, remainder (both ends) -> eval
+    Returns:
+        (i_train, i_eval) integer numpy arrays (sorted, non-overlapping)
+    """
+    num_images = len(image_filenames)
+    if not 0 <= train_split_fraction <= 1:
+        raise ValueError("train_split_fraction must be in [0, 1].")
+
+    num_train_images = int(math.ceil(num_images * train_split_fraction))
+    i_all = np.arange(num_images, dtype=int)
+
+    mode_l = mode.lower()
+    if mode_l == "first":
+        start = 0
+    elif mode_l == "last":
+        start = num_images - num_train_images
+    elif mode_l == "middle":
+        # center the training block; left-biased if not perfectly centered
+        start = (num_images - num_train_images) // 2
+    else:
+        raise ValueError("mode must be 'first', 'last', or 'middle'.")
+
+    # Clamp start for edge cases (e.g., 0% or 100% train)
+    start = max(0, min(start, num_images - num_train_images))
+
+    i_train = np.arange(start, start + num_train_images, dtype=int)
+    i_eval = np.setdiff1d(i_all, i_train, assume_unique=True)
+
+    assert len(i_train) == num_train_images
+    assert len(i_eval) == num_images - num_train_images
+    return i_train, i_eval
 
 def get_train_eval_split_fraction(image_filenames: List, train_split_fraction: float) -> Tuple[np.ndarray, np.ndarray]:
     """

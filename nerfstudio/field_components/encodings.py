@@ -419,7 +419,7 @@ class HashEncoding(Encoding):
 
     def pytorch_fwd(self, in_tensor: Float[Tensor, "*bs input_dim"]) -> Float[Tensor, "*bs output_dim"]:
         """Forward pass using pytorch. Significantly slower than TCNN implementation."""
-
+        print(f"Warning using pytorch implementation of HashEncoding. This is significantly slower than TCNN implementation.")
         assert in_tensor.shape[-1] == 3
         in_tensor = in_tensor[..., None, :]  # [..., 1, 3]
         scaled = in_tensor * self.scalings.view(-1, 1).to(in_tensor.device)  # [..., L, 3]
@@ -792,6 +792,7 @@ class SHEncoding(Encoding):
     @torch.no_grad()
     def pytorch_fwd(self, in_tensor: Float[Tensor, "*bs input_dim"]) -> Float[Tensor, "*bs output_dim"]:
         """Forward pass using pytorch. Significantly slower than TCNN implementation."""
+        print(f"Warning using pytorch implementation of SHEncoding. This is significantly slower than TCNN implementation.")
         return components_from_spherical_harmonics(levels=self.levels, directions=in_tensor)
 
     def forward(self, in_tensor: Float[Tensor, "*bs input_dim"]) -> Float[Tensor, "*bs output_dim"]:
