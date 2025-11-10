@@ -29,6 +29,7 @@ from threading import Lock
 from typing import DefaultDict, Dict, List, Literal, Optional, Tuple, Type, cast
 
 import torch
+import torch.autograd  # <--- ADD THIS LINE
 import viser
 from rich import box, style
 from rich.panel import Panel
@@ -497,11 +498,19 @@ class Trainer:
         self.optimizers.zero_grad_some(needs_zero)
         cpu_or_cuda_str: str = self.device.split(":")[0]
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
-
+        # with torch.autograd.detect_anomaly():
+            # REMOVE LATER 
+            # if step % 1000 == 0:
+            #     CONSOLE.log("USING DETECT ANOMALY FOR DEBUGGING PURPOSES. REMOVE LATER")
         with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
             _, loss_dict, metrics_dict = self.pipeline.get_train_loss_dict(step=step)
             loss = functools.reduce(torch.add, loss_dict.values())
         self.grad_scaler.scale(loss).backward()  # type: ignore
+
+        self.grad_scaler.unscale_(self.optimizers.optimizers["fields"])
+        self.grad_scaler.unscale_(self.optimizers.optimizers["proposal_networks"])
+        torch.nn.utils.clip_grad_norm_(self.pipeline.model.parameters(), 1.0)
+
         needs_step = [
             group
             for group in self.optimizers.parameters.keys()

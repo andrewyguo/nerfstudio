@@ -736,7 +736,7 @@ class DatasetRender(BaseRender):
 
         def update_config(config: TrainerConfig) -> TrainerConfig:
             data_manager_config = config.pipeline.datamanager
-            assert isinstance(data_manager_config, (VanillaDataManagerConfig, FullImageDatamanagerConfig))
+            assert isinstance(data_manager_config, (VanillaDataManagerConfig, FullImageDatamanagerConfig))  
             data_manager_config.eval_num_images_to_sample_from = -1
             data_manager_config.eval_num_times_to_repeat_images = -1
             if isinstance(data_manager_config, VanillaDataManagerConfig):

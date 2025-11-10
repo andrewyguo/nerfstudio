@@ -50,6 +50,10 @@ def get_train_eval_split_fraction_custom(
     elif mode_l == "middle":
         # center the training block; left-biased if not perfectly centered
         start = (num_images - num_train_images) // 2
+    elif mode_l == "edges":
+        # split the training block between the start and end; right-biased if not perfectly split
+        start = 0 if (num_train_images % 2 == 0) else 1
+
     else:
         raise ValueError("mode must be 'first', 'last', or 'middle'.")
 
