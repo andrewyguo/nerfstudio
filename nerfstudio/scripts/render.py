@@ -793,6 +793,7 @@ class DatasetRender(BaseRender):
                 TimeElapsedColumn(),
             ) as progress:
                 for camera_idx, (camera, batch) in enumerate(progress.track(dataloader, total=len(dataset))):
+                    # import IPython; IPython.embed(); exit(1)
                     with torch.no_grad():
                         outputs = pipeline.model.get_outputs_for_camera(camera)
                         if self.rendered_output_names is not None and "rgba" in self.rendered_output_names:
@@ -902,6 +903,199 @@ class DatasetRender(BaseRender):
             table.add_row(f"Outputs {split}", str(self.output_path / split))
         CONSOLE.print(Panel(table, title="[bold][green]:tada: Render on split {} Complete :tada:[/bold]", expand=False))
 
+@dataclass
+class RenderCameraPathRaw(BaseRender):
+    """Render a camera path to per-frame raw (npy) and/or rgb images.
+
+    By default, saves raw network outputs for "rgb" as .npy files (raw-rgb).
+    Additional outputs (e.g. rgb, depth) can be requested via --rendered-output-names
+    and will be saved as images (png/jpeg) with colormaps applied.
+    """
+
+    camera_path_filename: Path = Path("camera_path.json")
+    """Filename of the camera path to render."""
+    # We keep an output_format field for API/CLI similarity, but only "images"
+    # is supported here.
+    output_format: Literal["images"] = "images"
+    """This renderer only writes per-frame image files (no video)."""
+
+    # Override BaseRender default: render raw-rgb by default.
+    rendered_output_names: List[str] = field(default_factory=lambda: ["raw-rgb"])
+
+    def main(self) -> None:
+        """Main function."""
+        # Same eval_setup as RenderCameraPath
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+        )
+
+        # Load camera path JSON and construct Cameras object
+        with open(self.camera_path_filename, "r", encoding="utf-8") as f:
+            camera_path_json = json.load(f)
+
+        crop_data = get_crop_from_json(camera_path_json)
+        cameras = get_path_from_json(camera_path_json)
+
+        # Optional camera index metadata, same as RenderCameraPath
+        if self.camera_idx is not None:
+            cameras.metadata = {"cam_idx": self.camera_idx}
+
+        # Apply downscale factor (same logic as RenderCameraPath)
+        cameras.rescale_output_resolution(1.0 / self.downscale_factor)
+        cameras = cameras.to(pipeline.device)
+
+        # Normalize rendered_output_names: if somehow empty/None, default to raw-rgb
+        if not self.rendered_output_names:
+            self.rendered_output_names = ["raw-rgb"]
+
+        # Determine output root directory.
+        # If user passed a file-like path (with suffix), mirror RenderCameraPath
+        # and create a folder "<parent>/<stem>".
+        if self.output_path.suffix != "":
+            output_root = self.output_path.parent / self.output_path.stem
+        else:
+            output_root = self.output_path
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        progress = Progress(
+            TextColumn(":movie_camera: Rendering (raw) camera path :movie_camera:"),
+            BarColumn(),
+            TaskProgressColumn(
+                text_format="[progress.percentage]{task.completed}/{task.total:>.0f}({task.percentage:>3.1f}%)",
+                show_speed=True,
+            ),
+            ItersPerSecColumn(suffix="fps"),
+            TimeRemainingColumn(elapsed_when_finished=False, compact=False),
+            TimeElapsedColumn(),
+        )
+
+        with progress:
+            for camera_idx in progress.track(range(cameras.size), description=""):
+                obb_box = crop_data.obb if crop_data is not None else None
+
+                # Run model
+                if crop_data is not None:
+                    with renderers.background_color_override_context(
+                        crop_data.background_color.to(pipeline.device)
+                    ), torch.no_grad():
+                        outputs = pipeline.model.get_outputs_for_camera(
+                            cameras[camera_idx : camera_idx + 1], obb_box=obb_box
+                        )
+                else:
+                    with torch.no_grad():
+                        outputs = pipeline.model.get_outputs_for_camera(
+                            cameras[camera_idx : camera_idx + 1], obb_box=obb_box
+                        )
+
+                # Optionally compute rgba if requested
+                if self.rendered_output_names is not None and "rgba" in self.rendered_output_names:
+                    rgba = pipeline.model.get_rgba_image(outputs=outputs, output_name="rgb")
+                    outputs["rgba"] = rgba
+
+                # Valid names: raw-<key> or <key> for each outputs key
+                all_outputs = list(outputs.keys()) + [f"raw-{x}" for x in outputs.keys()]
+
+                for rendered_output_name in self.rendered_output_names:
+                    if rendered_output_name not in all_outputs:
+                        CONSOLE.rule("Error", style="red")
+                        CONSOLE.print(
+                            f"Could not find {rendered_output_name} in the model outputs",
+                            justify="center",
+                        )
+                        CONSOLE.print(
+                            f"Please set --rendered-output-names to one of: {all_outputs}",
+                            justify="center",
+                        )
+                        sys.exit(1)
+
+                    is_raw = False
+                    output_name = rendered_output_name
+                    is_depth = rendered_output_name.find("depth") != -1
+
+                    # Handle raw- prefix like DatasetRender
+                    if output_name.startswith("raw-"):
+                        is_raw = True
+                        output_name = output_name[4:]  # strip "raw-"
+                        output_image = outputs[output_name]
+                    else:
+                        output_image = outputs[output_name]
+
+                    # Map to numpy / colormaps
+                    if is_raw:
+                        # Save *network output* as-is (no colormap), like DatasetRender.
+                        output_image = output_image.cpu().numpy()
+                    elif output_name == "rgba":
+                        output_image = output_image.detach().cpu().numpy()
+                    elif is_depth:
+                        # Depth visualization
+                        output_image = (
+                            colormaps.apply_depth_colormap(
+                                output_image,
+                                accumulation=outputs.get("accumulation", None),
+                                near_plane=self.depth_near_plane,
+                                far_plane=self.depth_far_plane,
+                                colormap_options=self.colormap_options,
+                            )
+                            .cpu()
+                            .numpy()
+                        )
+                    else:
+                        # Standard RGB-like output
+                        output_image = (
+                            colormaps.apply_colormap(
+                                image=output_image,
+                                colormap_options=self.colormap_options,
+                            )
+                            .cpu()
+                            .numpy()
+                        )
+
+                    # Per-output subdirectory, similar to DatasetRender
+                    per_output_dir = output_root / rendered_output_name
+                    per_output_dir.mkdir(parents=True, exist_ok=True)
+
+                    frame_name = f"{camera_idx:05d}"
+
+                    # Save to disk
+                    if is_raw:
+                        # Raw outputs go to .npy
+                        np.save(per_output_dir / f"{frame_name}.npy", output_image)
+                    else:
+                        # Colored outputs -> png/jpeg, like other renderers
+                        if self.image_format == "png":
+                            media.write_image(
+                                per_output_dir / f"{frame_name}.png",
+                                output_image,
+                                fmt="png",
+                            )
+                        elif self.image_format == "jpeg":
+                            media.write_image(
+                                per_output_dir / f"{frame_name}.jpg",
+                                output_image,
+                                fmt="jpeg",
+                                quality=self.jpeg_quality,
+                            )
+                        else:
+                            raise ValueError(f"Unknown image format {self.image_format}")
+
+        # Nice summary table, matching style of other renderers
+        table = Table(
+            title=None,
+            show_header=False,
+            box=box.MINIMAL,
+            title_style=style.Style(bold=True),
+        )
+        table.add_row("Outputs", str(output_root))
+        CONSOLE.print(
+            Panel(
+                table,
+                title="[bold][green]:tada: Raw Camera Path Render Complete :tada:[/bold]",
+                expand=False,
+            )
+        )
+
 
 Commands = tyro.conf.FlagConversionOff[
     Union[
@@ -909,6 +1103,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[RenderInterpolated, tyro.conf.subcommand(name="interpolate")],
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
+        Annotated[RenderCameraPathRaw, tyro.conf.subcommand(name="camera-path-raw")],  # <-- new
     ]
 ]
 
